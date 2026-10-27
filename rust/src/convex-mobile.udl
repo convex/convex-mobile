@@ -47,8 +47,16 @@ interface MobileOptimisticUpdate {
     void apply(MobileOptimisticLocalStore store);
 };
 
+dictionary QueryCacheConfig {
+    string directory;
+    u32? capacity = null;
+    u64? max_age_ms = null;
+    sequence<string> shared_queries = [];
+    boolean keep_results_on_error = false;
+};
+
 interface MobileConvexClient {
-    constructor(string deployment_url, string client_id, WebSocketStateSubscriber? web_socket_state_subscriber, string? query_cache_directory);
+    constructor(string deployment_url, string client_id, WebSocketStateSubscriber? web_socket_state_subscriber, QueryCacheConfig? query_cache);
 
     [Async, Throws=ClientError]
     string query(string name, record<string, string> args);
@@ -72,6 +80,9 @@ interface MobileConvexClient {
     void clear_query_cache();
 
     [Async, Throws=ClientError]
+    void flush_query_cache();
+
+    [Async, Throws=ClientError]
     void set_auth_callback(AuthTokenProvider? provider);
 };
 
@@ -82,6 +93,6 @@ interface SubscriptionHandle {
 
 [Trait, WithForeign]
 interface QuerySubscriber {
-    void on_update(string value);
+    void on_update(string value, u64? cached_server_ts);
     void on_error(string message, string? value);
 };

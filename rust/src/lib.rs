@@ -1,14 +1,14 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 
 use async_once_cell::OnceCell;
 use convex::{
-    AuthTokenFetcher, AuthenticationToken, ConvexClient, ConvexClientBuilder,
-    FileQueryCacheStorage, FunctionResult, OptimisticLocalStore, OptimisticQuery,
-    QueryCacheStorage, Value,
-    WebSocketState,
+    AuthTokenFetcher, AuthenticationToken, ConvexClient, ConvexClientBuilder, FunctionResult,
+    OptimisticLocalStore, OptimisticQuery, QueryCacheOptions, QueryCacheStorage,
+    SqliteQueryCacheStorage, Value, WebSocketState,
 };
 use futures::{
     channel::oneshot::{self, Sender},
@@ -44,7 +44,10 @@ impl From<anyhow::Error> for ClientError {
 }
 
 pub trait QuerySubscriber: Send + Sync {
-    fn on_update(&self, value: String) -> ();
+    /// `cached_server_ts`: set when the value was restored from the query
+    /// cache rather than sent by the server in this run, to the server
+    /// timestamp (nanoseconds since the Unix epoch) at which it was last sent.
+    fn on_update(&self, value: String, cached_server_ts: Option<u64>) -> ();
 
     fn on_error(&self, message: String, value: Option<String>) -> ();
 }
@@ -218,13 +221,55 @@ struct MobileConvexClient {
     deployment_url: String,
     client_id: String,
     web_socket_state_subscriber: Option<Arc<dyn WebSocketStateSubscriber>>,
-    query_cache_directory: Option<String>,
+    query_cache: Option<QueryCacheConfig>,
     client: OnceCell<ConvexClient>,
     /// Held while the client is created and stored, since creating it loads
     /// the query cache, so clearing the cache can't miss results loaded by a
     /// concurrent connect.
     client_init_lock: tokio::sync::Mutex<()>,
     rt: tokio::runtime::Runtime,
+}
+
+/// Where and how a [MobileConvexClient] caches query results across runs.
+#[derive(Clone)]
+pub struct QueryCacheConfig {
+    /// The directory for the cache's SQLite database file.
+    pub directory: String,
+    /// How many query results to keep. Defaults to
+    /// [`convex::DEFAULT_QUERY_CACHE_CAPACITY`].
+    pub capacity: Option<u32>,
+    /// Don't restore results the server sent more than this many milliseconds
+    /// ago. Defaults to no limit.
+    pub max_age_ms: Option<u64>,
+    /// Names of queries ("module:function") whose results are the same for
+    /// every user: shown whoever is signed in and kept when users sign out.
+    pub shared_queries: Vec<String>,
+    /// Keep a query's cached result when the server reports an error for it.
+    pub keep_results_on_error: bool,
+}
+
+impl QueryCacheConfig {
+    fn options(&self) -> QueryCacheOptions {
+        let mut options = QueryCacheOptions::default();
+        if let Some(capacity) = self.capacity {
+            options.capacity = capacity as usize;
+        }
+        options.max_age = self.max_age_ms.map(Duration::from_millis);
+        if !self.shared_queries.is_empty() {
+            let shared: HashSet<String> = self.shared_queries.iter().cloned().collect();
+            options.shared_queries = Some(Arc::new(move |name: &str, _args: &BTreeMap<String, Value>| {
+                shared.contains(name)
+            }));
+        }
+        options.keep_results_on_error = self.keep_results_on_error;
+        options
+    }
+}
+
+/// The query cache in `directory`: one SQLite database file.
+fn open_query_cache(directory: &str) -> anyhow::Result<SqliteQueryCacheStorage> {
+    std::fs::create_dir_all(directory)?;
+    SqliteQueryCacheStorage::open(std::path::Path::new(directory).join("query-cache.sqlite"))
 }
 
 impl MobileConvexClient {
@@ -236,14 +281,14 @@ impl MobileConvexClient {
     /// The `client_id` should be a string representing the name and version of
     /// the foreign client.
     ///
-    /// If `query_cache_directory` is set, the latest query results are saved in
-    /// that directory and shown by subscriptions in later runs until fresh
-    /// results arrive, including while offline.
+    /// If `query_cache` is set, the latest query results are saved in its
+    /// directory and shown by subscriptions in later runs until fresh results
+    /// arrive, including while offline.
     pub fn new(
         deployment_url: String,
         client_id: String,
         web_socket_state_subscriber: Option<Arc<dyn WebSocketStateSubscriber>>,
-        query_cache_directory: Option<String>,
+        query_cache: Option<QueryCacheConfig>,
     ) -> MobileConvexClient {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -253,7 +298,7 @@ impl MobileConvexClient {
             deployment_url,
             client_id,
             web_socket_state_subscriber,
-            query_cache_directory,
+            query_cache,
             client: OnceCell::new(),
             client_init_lock: tokio::sync::Mutex::new(()),
             rt,
@@ -289,7 +334,7 @@ impl MobileConvexClient {
                 }
 
                 let has_subscriber = possible_subscriber.is_some();
-                let query_cache_directory = self.query_cache_directory.clone();
+                let query_cache = self.query_cache.clone();
                 self.rt
                     .spawn(async move {
                         let mut builder =
@@ -297,9 +342,10 @@ impl MobileConvexClient {
                         if has_subscriber {
                             builder = builder.with_on_state_change(tx);
                         }
-                        if let Some(directory) = query_cache_directory {
+                        if let Some(config) = query_cache {
                             builder = builder
-                                .with_query_cache(Arc::new(FileQueryCacheStorage::new(directory)));
+                                .with_query_cache(Arc::new(open_query_cache(&config.directory)?))
+                                .with_query_cache_options(config.options());
                         }
                         builder.build().await
                     })
@@ -358,7 +404,7 @@ impl MobileConvexClient {
                             Some(FunctionResult::Value(value)) => {
                                 subscriber.on_update(serde_json::to_string(
                                     &serde_json::Value::from(value)
-                                ).unwrap())
+                                ).unwrap(), subscription.cached_server_ts())
                             },
                             Some(FunctionResult::ErrorMessage(message)) => {
                                 subscriber.on_error(message, None)
@@ -484,21 +530,35 @@ impl MobileConvexClient {
         let _init_guard = self.client_init_lock.lock().await;
         match self.client.get() {
             Some(client) => {
-                let mut client = client.clone();
+                let client = client.clone();
                 self.rt
                     .spawn(async move { client.clear_query_cache().await })
                     .await
                     .map_err(anyhow::Error::from)??;
             },
             None => {
-                if let Some(directory) = self.query_cache_directory.clone() {
+                if let Some(directory) = self.query_cache.as_ref().map(|c| c.directory.clone()) {
                     self.rt
-                        .spawn(async move { FileQueryCacheStorage::new(directory).clear().await })
+                        .spawn(async move { open_query_cache(&directory)?.clear().await })
                         .await
                         .map_err(anyhow::Error::from)??;
                 }
             },
         }
+        Ok(())
+    }
+
+    /// Wait until cached query results changed so far are saved, e.g. before
+    /// the app is suspended. Does nothing without a query cache or before the
+    /// client has connected.
+    pub async fn flush_query_cache(&self) -> Result<(), ClientError> {
+        let Some(client) = self.client.get().cloned() else {
+            return Ok(());
+        };
+        self.rt
+            .spawn(async move { client.flush_query_cache().await })
+            .await
+            .map_err(anyhow::Error::from)??;
         Ok(())
     }
 

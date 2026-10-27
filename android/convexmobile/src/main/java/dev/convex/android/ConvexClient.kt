@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -42,11 +43,51 @@ typealias Int32 = @Serializable(Int64ToIntDecoder::class) Int
 typealias Float32 = @Serializable(Float64ToFloatDecoder::class) Float
 typealias ConvexNum = Contextual
 
+/**
+ * Where and how [ConvexClient] caches query results across runs.
+ *
+ * @param directory the directory for the cache's database file, e.g. [defaultQueryCacheDirectory]
+ * @param capacity how many query results to keep, evicting those the server sent least recently;
+ * null for the default (1000)
+ * @param maxAgeMillis don't restore results the server sent more than this long ago; null for no
+ * limit
+ * @param sharedQueries names ("module:function") of queries whose results are the same for every
+ * user, so they're shown whoever is signed in and kept when users sign out. Only list queries that
+ * don't read `ctx.auth`.
+ * @param keepResultsOnError keep a query's cached result when the server reports an error for it
+ */
+data class QueryCacheOptions(
+    val directory: String,
+    val capacity: Int? = null,
+    val maxAgeMillis: Long? = null,
+    val sharedQueries: Set<String> = emptySet(),
+    val keepResultsOnError: Boolean = false,
+) {
+    internal fun toFfi() = QueryCacheConfig(
+        directory = directory,
+        capacity = capacity?.toUInt(),
+        maxAgeMs = maxAgeMillis?.toULong(),
+        sharedQueries = sharedQueries.toList(),
+        keepResultsOnError = keepResultsOnError,
+    )
+}
+
+/**
+ * A query result from [ConvexClient.subscribeWithCacheInfo].
+ *
+ * @param cachedAtMillis set when [value] was restored from the query cache and the server hasn't
+ * confirmed it in this run yet: when the server last sent it, in milliseconds since the Unix epoch.
+ * The subscription sends the server's result once it arrives, even if it's the same.
+ */
+data class QueryUpdate<T>(val value: T, val cachedAtMillis: Long?) {
+    val isCached: Boolean get() = cachedAtMillis != null
+}
+
 private fun defaultFfiClientFactory(
-    queryCacheDirectory: String?
+    queryCache: QueryCacheOptions?
 ): (String, String, WebSocketStateSubscriber?) -> MobileConvexClientInterface =
     { deploymentUrl, clientId, webSocketStateSubscriber ->
-        MobileConvexClient(deploymentUrl, clientId, webSocketStateSubscriber, queryCacheDirectory)
+        MobileConvexClient(deploymentUrl, clientId, webSocketStateSubscriber, queryCache?.toFfi())
     }
 
 /**
@@ -70,13 +111,15 @@ fun defaultQueryCacheDirectory(context: Context, deploymentUrl: String): String 
  *
  * @param queryCacheDirectory if set, the latest query results are saved in this directory and shown
  * by subscriptions in later runs until fresh results arrive, including while offline. Use one
- * directory per client, e.g. [defaultQueryCacheDirectory]. Cached results belong to whoever was
- * signed in; call [clearQueryCache] when that changes.
+ * directory per client, e.g. [defaultQueryCacheDirectory]. Results are saved for the user they
+ * were fetched for and only shown to that user; signing out deletes them.
+ * @param queryCache the query cache with more settings than [queryCacheDirectory]; overrides it
  */
 open class ConvexClient(
     deploymentUrl: String,
     queryCacheDirectory: String? = null,
-    ffiClientFactory: (deploymentUrl: String, clientId: String, webSocketStateSubscriber: WebSocketStateSubscriber?) -> MobileConvexClientInterface = defaultFfiClientFactory(queryCacheDirectory)
+    queryCache: QueryCacheOptions? = queryCacheDirectory?.let { QueryCacheOptions(it) },
+    ffiClientFactory: (deploymentUrl: String, clientId: String, webSocketStateSubscriber: WebSocketStateSubscriber?) -> MobileConvexClientInterface = defaultFfiClientFactory(queryCache)
 ) {
     private val _webSocketStateFlow = MutableStateFlow(WebSocketState.CONNECTING)
     private val webSocketStateSubscriber = object : WebSocketStateSubscriber {
@@ -114,15 +157,24 @@ open class ConvexClient(
      */
     inline fun <reified T> subscribe(
         name: String, args: Map<String, Any?>? = null
-    ): Flow<Result<T>> = callbackFlow {
+    ): Flow<Result<T>> = subscribeWithCacheInfo<T>(name, args).map { result -> result.map { it.value } }
+
+    /**
+     * Like [subscribe], but each result says whether it was restored from the query cache (see
+     * [QueryUpdate]), e.g. to show that it may be out of date.
+     */
+    inline fun <reified T> subscribeWithCacheInfo(
+        name: String, args: Map<String, Any?>? = null
+    ): Flow<Result<QueryUpdate<T>>> = callbackFlow {
         val subscription = ffiClient.subscribe(
             name,
             args?.mapValues { it.value.toJsonElement().toString() } ?: mapOf(),
             object : QuerySubscriber {
-                override fun onUpdate(value: String) {
+                override fun onUpdate(value: String, cachedServerTs: ULong?) {
                     try {
                         val data = jsonApi.decodeFromString<T>(value)
-                        trySend(Result.success(data))
+                        val cachedAtMillis = cachedServerTs?.let { (it / 1_000_000u).toLong() }
+                        trySend(Result.success(QueryUpdate(data, cachedAtMillis)))
                     } catch (e: Throwable) {
                         // Don't catch when https://github.com/mozilla/uniffi-rs/issues/2194 is fixed.
                         // Ideally any unchecked exception that happens here goes uncaught and triggers
@@ -294,6 +346,18 @@ open class ConvexClient(
         }
     }
 
+    /**
+     * Waits until cached query results changed so far are saved, e.g. before the app is stopped.
+     * Does nothing without a query cache.
+     */
+    suspend fun flushQueryCache() {
+        try {
+            ffiClient.flushQueryCache()
+        } catch (e: ClientException) {
+            throw e.toError()
+        }
+    }
+
     @PublishedApi
     internal fun optimisticUpdateAdapter(update: OptimisticUpdate): OptimisticUpdateAdapter =
         OptimisticUpdateAdapter(update)
@@ -309,8 +373,9 @@ class ConvexClientWithAuth<T>(
     private val authProvider: AuthProvider<T>,
     private val coroutineScope: CoroutineScope = CoroutineScope(SupervisorJob()),
     queryCacheDirectory: String? = null,
-    ffiClientFactory: (deploymentUrl: String, clientId: String, webSocketSocketStateSubscriber: WebSocketStateSubscriber?) -> MobileConvexClientInterface = defaultFfiClientFactory(queryCacheDirectory)
-) : ConvexClient(deploymentUrl, queryCacheDirectory, ffiClientFactory) {
+    queryCache: QueryCacheOptions? = queryCacheDirectory?.let { QueryCacheOptions(it) },
+    ffiClientFactory: (deploymentUrl: String, clientId: String, webSocketSocketStateSubscriber: WebSocketStateSubscriber?) -> MobileConvexClientInterface = defaultFfiClientFactory(queryCache)
+) : ConvexClient(deploymentUrl, queryCacheDirectory, queryCache, ffiClientFactory) {
     private val _authState = MutableStateFlow<AuthState<T>>(AuthState.Unauthenticated())
     private var authBridge: AuthTokenProviderBridge? = null
 
