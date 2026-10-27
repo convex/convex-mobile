@@ -43,6 +43,8 @@ class FakeFfiClient : MobileConvexClientInterface {
 
     override suspend fun clearQueryCache() {}
 
+    override suspend fun flushQueryCache() {}
+
     override suspend fun query(name: String, args: Map<String, String>): String {
         TODO("Not yet implemented")
     }
@@ -72,7 +74,7 @@ class FakeFfiClient : MobileConvexClientInterface {
     fun sendSubscriptionData(name: String, args: Map<String, Any?>, data: String) {
         subscriptions[CallKey(
             name,
-            args.mapValues { it.value.toJsonElement().toString() })]!!.onUpdate(data)
+            args.mapValues { it.value.toJsonElement().toString() })]!!.onUpdate(data, null)
     }
 
     fun sendSubscriptionError(
