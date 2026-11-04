@@ -45,7 +45,7 @@ typealias ConvexNum = Contextual
  * A client API for interacting with a Convex backend.
  *
  * Handles marshalling of data between calling code and the [convex-mobile]() and
- * [convex-rs](https://github.com/get-convex/convex-rs) native libraries.
+ * [convex-rs](https://github.com/convex/convex-rs) native libraries.
  *
  * Consumers of this client should use Kotlin's JSON serialization to handle data sent to/from the
  * Convex backend.

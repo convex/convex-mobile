@@ -5,7 +5,7 @@ The official Android client for [Convex](https://www.convex.dev/).
 Convex is the backend application platform with everything you need to build your product.
 
 This library lets you create Convex applications that run on Android. It builds on the
-[Convex Rust client](https://github.com/get-convex/convex-rs) and offers a convenient Android API
+[Convex Rust client](https://github.com/convex/convex-rs) and offers a convenient Android API
 for executing queries, actions and mutations.
 
 ## Getting Started
@@ -71,7 +71,7 @@ library.
 ### Step by Step
 
 1. Ensure you have build tools available on your OS (XCode on Mac, `build-essential` on Linux)
-2. Clone https://github.com/get-convex/convex-mobile
+2. Clone https://github.com/convex/convex-mobile
 3. Install Android Studio
 4. Use the SDK Manager to install NDK version 27.3.13750724
     1. Open android studio. Press shift-shift and search sdk manager
