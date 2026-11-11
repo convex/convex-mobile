@@ -142,22 +142,16 @@ impl MobileConvexClient {
         self.client
             .get_or_try_init(async {
                 let client_id = self.client_id.to_owned();
-                let (tx, mut rx) = mpsc::channel(1);
-                let possible_subscriber = self.web_socket_state_subscriber.clone();
-                if let Some(subscriber) = possible_subscriber.clone() {
-                    self.rt.spawn(async move {
-                        while let Some(state) = rx.recv().await {
-                            subscriber.on_state_change(state);
-                        }
-                    });
-                }
+                let on_state_change = self
+                    .web_socket_state_subscriber
+                    .clone()
+                    .map(|subscriber| forward_web_socket_states(self.rt.handle(), subscriber));
 
-                let has_subscriber = possible_subscriber.is_some();
                 self.rt
                     .spawn(async move {
                         let mut builder =
                             ConvexClientBuilder::new(url.as_str()).with_client_id(&client_id);
-                        if has_subscriber {
+                        if let Some(tx) = on_state_change {
                             builder = builder.with_on_state_change(tx);
                         }
                         builder.build().await
@@ -348,6 +342,30 @@ impl MobileConvexClient {
     }
 }
 
+/// Room for the WebSocket states sent before the subscriber has been called
+/// with the first of them.
+///
+/// The [ConvexClient] sends states with `try_send`, which drops a state when
+/// the channel is full. A dropped state can leave the subscriber with a stale
+/// one, such as `Connecting` while connected, until the next change. A few
+/// reconnects in quick succession send two states each.
+const WEB_SOCKET_STATE_CHANNEL_CAPACITY: usize = 16;
+
+/// Returns a sender for [ConvexClientBuilder::with_on_state_change] whose
+/// states are passed to `subscriber` in order, on a task spawned on `rt`.
+fn forward_web_socket_states(
+    rt: &tokio::runtime::Handle,
+    subscriber: Arc<dyn WebSocketStateSubscriber>,
+) -> mpsc::Sender<WebSocketState> {
+    let (tx, mut rx) = mpsc::channel(WEB_SOCKET_STATE_CHANNEL_CAPACITY);
+    rt.spawn(async move {
+        while let Some(state) = rx.recv().await {
+            subscriber.on_state_change(state);
+        }
+    });
+    tx
+}
+
 fn parse_json_args(raw_args: HashMap<String, String>) -> BTreeMap<String, Value> {
     raw_args
         .into_iter()
@@ -379,12 +397,51 @@ uniffi::include_scaffolding!("convex-mobile");
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
 
-    use convex::Value;
+    use convex::{Value, WebSocketState};
     use maplit::btreemap;
+    use tokio::sync::mpsc;
 
-    use crate::parse_json_args;
+    use crate::{forward_web_socket_states, parse_json_args, WebSocketStateSubscriber};
+
+    struct StateRecorder(mpsc::UnboundedSender<WebSocketState>);
+
+    impl WebSocketStateSubscriber for StateRecorder {
+        fn on_state_change(&self, state: WebSocketState) {
+            let _ = self.0.send(state);
+        }
+    }
+
+    #[test]
+    fn test_web_socket_states_sent_in_a_burst_all_reach_the_subscriber() {
+        // A current-thread runtime runs the forwarding task only inside
+        // `block_on`, so every state below is sent before the first is passed
+        // on, as when the subscriber is slow to return.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (recorded_tx, mut recorded_rx) = mpsc::unbounded_channel();
+        let tx = forward_web_socket_states(rt.handle(), Arc::new(StateRecorder(recorded_tx)));
+
+        // The initial connect and three reconnects, sent the way the
+        // ConvexClient sends them.
+        for _ in 0..4 {
+            let _ = tx.try_send(WebSocketState::Connecting);
+            let _ = tx.try_send(WebSocketState::Connected);
+        }
+        drop(tx);
+
+        let recorded = rt.block_on(async {
+            let mut recorded = Vec::new();
+            while let Some(state) = recorded_rx.recv().await {
+                recorded.push(format!("{state:?}"));
+            }
+            recorded
+        });
+        assert_eq!(recorded, ["Connecting", "Connected"].repeat(4));
+    }
 
     #[test]
     fn test_boolean_values_in_json_args() {
