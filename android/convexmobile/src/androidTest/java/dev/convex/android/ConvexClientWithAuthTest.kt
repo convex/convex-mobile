@@ -169,6 +169,29 @@ class ConvexClientWithAuthTest {
     }
 
     @Test
+    fun force_refresh_success_replaces_cached_token() = runTest {
+        val (client, ffiClient, authProvider) = createClient()
+
+        client.login(ApplicationProvider.getApplicationContext())
+        val refreshedToken = "refreshed_token_value"
+        authProvider.idToken = refreshedToken
+
+        assertEquals(refreshedToken, ffiClient.receivedAuthProvider?.fetchToken(true))
+        assertEquals(refreshedToken, ffiClient.receivedAuthProvider?.fetchToken(false))
+    }
+
+    @Test
+    fun force_refresh_failure_keeps_cached_token() = runTest {
+        val (client, ffiClient, authProvider) = createClient()
+
+        client.login(ApplicationProvider.getApplicationContext())
+        authProvider.simulateFailure = true
+
+        assertEquals(FakeCredentials.idToken, ffiClient.receivedAuthProvider?.fetchToken(true))
+        assertEquals(FakeCredentials.idToken, ffiClient.receivedAuthProvider?.fetchToken(false))
+    }
+
+    @Test
     fun tokenRefresh_updates_auth_callback() = runTest {
         val (client, ffiClient, authProvider) = createClient()
 
@@ -206,6 +229,7 @@ private data object FakeCredentials {
 
 private class FakeAuthProvider : AuthProvider<FakeCredentials> {
     var simulateFailure = false
+    var idToken = FakeCredentials.idToken
     var loginFromCacheCallCount = 0
     private var storedOnIdToken: ((String?) -> Unit)? = null
 
@@ -239,7 +263,7 @@ private class FakeAuthProvider : AuthProvider<FakeCredentials> {
         return Result.success(null)
     }
 
-    override fun extractIdToken(authResult: FakeCredentials) = authResult.idToken
+    override fun extractIdToken(authResult: FakeCredentials) = idToken
 
     fun simulateTokenRefresh(newToken: String?) {
         storedOnIdToken?.invoke(newToken)

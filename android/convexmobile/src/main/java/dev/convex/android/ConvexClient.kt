@@ -323,7 +323,9 @@ class ConvexClientWithAuth<T>(
      *
      * Caches the latest pushed token so the Rust client can pull it on demand (e.g. on WebSocket
      * reconnect). When [forceRefresh] is requested, delegates to [loginFromCache] via the
-     * [getValidToken] lambda to obtain a fresh token.
+     * [getValidToken] lambda to obtain a fresh token. If that fails, as it can while the device is
+     * offline, the cached token is kept: the server rejects it if it has expired, and the Rust
+     * client then fetches again.
      */
     private inner class AuthTokenProviderBridge(
         initialToken: String?,
@@ -334,7 +336,7 @@ class ConvexClientWithAuth<T>(
 
         override suspend fun fetchToken(forceRefresh: Boolean): String? = mutex.withLock {
             if (forceRefresh) {
-                cachedToken = getValidToken()
+                getValidToken()?.let { cachedToken = it }
             }
             cachedToken
         }
