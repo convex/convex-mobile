@@ -44,31 +44,19 @@ typealias Float32 = @Serializable(Float64ToFloatDecoder::class) Float
 typealias ConvexNum = Contextual
 
 /**
- * Where and how [ConvexClient] caches query results across runs.
+ * Where [ConvexClient] caches query results across runs.
  *
  * @param directory the directory for the cache's database file, e.g. [defaultQueryCacheDirectory]
- * @param capacity how many query results to keep, evicting those the server sent least recently;
- * null for the default (1000)
- * @param maxAgeMillis don't restore results the server sent more than this long ago; null for no
- * limit
- * @param sharedQueries names ("module:function") of queries whose results are the same for every
- * user, so they're shown whoever is signed in and kept when users sign out. Only list queries that
- * don't read `ctx.auth`.
- * @param keepResultsOnError keep a query's cached result when the server reports an error for it
+ * @param maxBytes the most bytes of query results to keep, keeping the newest; null for the
+ * default (2 MB)
  */
 data class QueryCacheOptions(
     val directory: String,
-    val capacity: Int? = null,
-    val maxAgeMillis: Long? = null,
-    val sharedQueries: Set<String> = emptySet(),
-    val keepResultsOnError: Boolean = false,
+    val maxBytes: Long? = null,
 ) {
     internal fun toFfi() = QueryCacheConfig(
         directory = directory,
-        capacity = capacity?.toUInt(),
-        maxAgeMs = maxAgeMillis?.toULong(),
-        sharedQueries = sharedQueries.toList(),
-        keepResultsOnError = keepResultsOnError,
+        maxBytes = maxBytes?.toULong(),
     )
 }
 
@@ -111,8 +99,8 @@ fun defaultQueryCacheDirectory(context: Context, deploymentUrl: String): String 
  *
  * @param queryCacheDirectory if set, the latest query results are saved in this directory and shown
  * by subscriptions in later runs until fresh results arrive, including while offline. Use one
- * directory per client, e.g. [defaultQueryCacheDirectory]. Results are saved for the user they
- * were fetched for and only shown to that user; signing out deletes them.
+ * directory per client, e.g. [defaultQueryCacheDirectory]. The cache holds the results of the user
+ * signed in last, and signing out or in as someone else deletes them.
  * @param queryCache the query cache with more settings than [queryCacheDirectory]; overrides it
  */
 open class ConvexClient(
@@ -333,31 +321,6 @@ open class ConvexClient(
         mutation<Unit?>(name = name, args = args, optimisticUpdate = optimisticUpdate)
     }
 
-    /**
-     * Deletes all cached query results, in memory and on disk, for example when the user signs
-     * out. Subscriptions showing a cached result go back to loading until the server sends a
-     * fresh one. Does nothing if the client has no `queryCacheDirectory`.
-     */
-    suspend fun clearQueryCache() {
-        try {
-            ffiClient.clearQueryCache()
-        } catch (e: ClientException) {
-            throw e.toError()
-        }
-    }
-
-    /**
-     * Waits until cached query results changed so far are saved, e.g. before the app is stopped.
-     * Does nothing without a query cache.
-     */
-    suspend fun flushQueryCache() {
-        try {
-            ffiClient.flushQueryCache()
-        } catch (e: ClientException) {
-            throw e.toError()
-        }
-    }
-
     @PublishedApi
     internal fun optimisticUpdateAdapter(update: OptimisticUpdate): OptimisticUpdateAdapter =
         OptimisticUpdateAdapter(update)
@@ -392,7 +355,7 @@ class ConvexClientWithAuth<T>(
      * the result.
      */
     suspend fun login(context: Context): Result<T> =
-        loginWithStrategy(isNewSession = true) { cb -> authProvider.login(context, cb) }
+        loginWithStrategy { cb -> authProvider.login(context, cb) }
 
     /**
      * Triggers a cached, UI-less re-authentication flow using previously stored credentials and
@@ -410,29 +373,25 @@ class ConvexClientWithAuth<T>(
      * @throws NotImplementedError if the [AuthProvider] doesn't support [loginFromCache]
      */
     suspend fun loginFromCache(): Result<T> =
-        loginWithStrategy(isNewSession = false) { cb -> authProvider.loginFromCache(cb) }
+        loginWithStrategy { cb -> authProvider.loginFromCache(cb) }
 
     /**
      * Triggers a logout flow and updates the [authState].
      *
-     * The [authState] will change to [AuthState.Unauthenticated] if logout is successful. Cached
-     * query results are cleared either way, so they aren't shown to whoever signs in next.
+     * The [authState] will change to [AuthState.Unauthenticated] if logout is successful, which
+     * also deletes cached query results.
      */
     suspend fun logout(context: Context): Result<Void?> {
         val result = authProvider.logout(context)
         if (result.isSuccess) {
             authBridge = null
             ffiClient.setAuthCallback(null)
-        }
-        clearQueryCacheLoggingErrors()
-        if (result.isSuccess) {
             _authState.emit(AuthState.Unauthenticated())
         }
         return result
     }
 
     private suspend fun loginWithStrategy(
-        isNewSession: Boolean,
         strategy: suspend (onIdToken: (String?) -> Unit) -> Result<T>
     ): Result<T> {
         _authState.emit(AuthState.AuthLoading())
@@ -447,12 +406,6 @@ class ConvexClientWithAuth<T>(
                         ?.let { authProvider.extractIdToken(it) }
                 }
             )
-            // A user may switch accounts without logging out; the previous user's cached results
-            // mustn't be shown to the new one. Clear them before installing the new session, so
-            // they aren't shown in between and the new session's results aren't deleted.
-            if (isNewSession && authBridge != null) {
-                clearQueryCacheLoggingErrors()
-            }
             authBridge = bridge
             ffiClient.setAuthCallback(bridge)
             _authState.emit(AuthState.Authenticated(authData))
@@ -465,14 +418,6 @@ class ConvexClientWithAuth<T>(
      * This handler is passed to the auth provider during login and should be called
      * whenever a fresh token is available or when the session becomes invalid.
      */
-    private suspend fun clearQueryCacheLoggingErrors() {
-        try {
-            ffiClient.clearQueryCache()
-        } catch (e: ClientException) {
-            Log.e("ConvexClientWithAuth", "Failed to clear the query cache", e)
-        }
-    }
-
     private fun onIdTokenHandler(): (String?) -> Unit = { token ->
         coroutineScope.launch {
             try {
@@ -480,11 +425,9 @@ class ConvexClientWithAuth<T>(
                     authBridge?.updateToken(token)
                     authBridge?.let { ffiClient.setAuthCallback(it) }
                 } else {
-                    // The session is no longer valid, so its cached results mustn't be shown to
-                    // whoever signs in next.
+                    // The session is no longer valid. Signing out deletes its cached results.
                     authBridge = null
                     ffiClient.setAuthCallback(null)
-                    clearQueryCacheLoggingErrors()
                     _authState.emit(AuthState.Unauthenticated())
                 }
             } catch (e: Exception) {

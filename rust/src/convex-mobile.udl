@@ -49,10 +49,7 @@ interface MobileOptimisticUpdate {
 
 dictionary QueryCacheConfig {
     string directory;
-    u32? capacity = null;
-    u64? max_age_ms = null;
-    sequence<string> shared_queries = [];
-    boolean keep_results_on_error = false;
+    u64? max_bytes = null;
 };
 
 interface MobileConvexClient {
@@ -75,12 +72,6 @@ interface MobileConvexClient {
 
     [Async, Throws=ClientError]
     void set_auth(string? token);
-
-    [Async, Throws=ClientError]
-    void clear_query_cache();
-
-    [Async, Throws=ClientError]
-    void flush_query_cache();
 
     [Async, Throws=ClientError]
     void set_auth_callback(AuthTokenProvider? provider);

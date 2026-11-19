@@ -41,10 +41,6 @@ class FakeFfiClient : MobileConvexClientInterface {
         return mutation(name, args)
     }
 
-    override suspend fun clearQueryCache() {}
-
-    override suspend fun flushQueryCache() {}
-
     override suspend fun query(name: String, args: Map<String, String>): String {
         TODO("Not yet implemented")
     }

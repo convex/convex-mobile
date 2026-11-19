@@ -1,14 +1,13 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     sync::Arc,
-    time::Duration,
 };
 
 use async_once_cell::OnceCell;
 use convex::{
     AuthTokenFetcher, AuthenticationToken, ConvexClient, ConvexClientBuilder, FunctionResult,
-    OptimisticLocalStore, OptimisticQuery, QueryCacheOptions, QueryCacheStorage,
-    SqliteQueryCacheStorage, Value, WebSocketState,
+    OptimisticLocalStore, OptimisticQuery, SqliteQueryCacheStorage, Value, WebSocketState,
+    DEFAULT_QUERY_CACHE_MAX_BYTES,
 };
 use futures::{
     channel::oneshot::{self, Sender},
@@ -223,47 +222,17 @@ struct MobileConvexClient {
     web_socket_state_subscriber: Option<Arc<dyn WebSocketStateSubscriber>>,
     query_cache: Option<QueryCacheConfig>,
     client: OnceCell<ConvexClient>,
-    /// Held while the client is created and stored, since creating it loads
-    /// the query cache, so clearing the cache can't miss results loaded by a
-    /// concurrent connect.
-    client_init_lock: tokio::sync::Mutex<()>,
     rt: tokio::runtime::Runtime,
 }
 
-/// Where and how a [MobileConvexClient] caches query results across runs.
+/// Where a [MobileConvexClient] caches query results across runs.
 #[derive(Clone)]
 pub struct QueryCacheConfig {
     /// The directory for the cache's SQLite database file.
     pub directory: String,
-    /// How many query results to keep. Defaults to
-    /// [`convex::DEFAULT_QUERY_CACHE_CAPACITY`].
-    pub capacity: Option<u32>,
-    /// Don't restore results the server sent more than this many milliseconds
-    /// ago. Defaults to no limit.
-    pub max_age_ms: Option<u64>,
-    /// Names of queries ("module:function") whose results are the same for
-    /// every user: shown whoever is signed in and kept when users sign out.
-    pub shared_queries: Vec<String>,
-    /// Keep a query's cached result when the server reports an error for it.
-    pub keep_results_on_error: bool,
-}
-
-impl QueryCacheConfig {
-    fn options(&self) -> QueryCacheOptions {
-        let mut options = QueryCacheOptions::default();
-        if let Some(capacity) = self.capacity {
-            options.capacity = capacity as usize;
-        }
-        options.max_age = self.max_age_ms.map(Duration::from_millis);
-        if !self.shared_queries.is_empty() {
-            let shared: HashSet<String> = self.shared_queries.iter().cloned().collect();
-            options.shared_queries = Some(Arc::new(move |name: &str, _args: &BTreeMap<String, Value>| {
-                shared.contains(name)
-            }));
-        }
-        options.keep_results_on_error = self.keep_results_on_error;
-        options
-    }
+    /// The most bytes of query results to keep, keeping the newest. Defaults
+    /// to [`convex::DEFAULT_QUERY_CACHE_MAX_BYTES`].
+    pub max_bytes: Option<u64>,
 }
 
 /// The query cache in `directory`: one SQLite database file.
@@ -283,7 +252,9 @@ impl MobileConvexClient {
     ///
     /// If `query_cache` is set, the latest query results are saved in its
     /// directory and shown by subscriptions in later runs until fresh results
-    /// arrive, including while offline.
+    /// arrive, including while offline. The cache holds the results of the
+    /// user signed in last, and signing out or in as someone else deletes
+    /// them.
     pub fn new(
         deployment_url: String,
         client_id: String,
@@ -300,7 +271,6 @@ impl MobileConvexClient {
             web_socket_state_subscriber,
             query_cache,
             client: OnceCell::new(),
-            client_init_lock: tokio::sync::Mutex::new(()),
             rt,
         }
     }
@@ -313,13 +283,8 @@ impl MobileConvexClient {
     /// Returns an error if ...
     /// TODO figure out reasons.
     async fn connected_client(&self) -> anyhow::Result<ConvexClient> {
-        if let Some(client) = self.client.get() {
-            return Ok(client.clone());
-        }
         let url = self.deployment_url.clone();
 
-        // Held until the client is stored, so `clear_query_cache` sees it.
-        let _init_guard = self.client_init_lock.lock().await;
         self.client
             .get_or_try_init(async {
                 let client_id = self.client_id.to_owned();
@@ -337,9 +302,15 @@ impl MobileConvexClient {
                             builder = builder.with_on_state_change(tx);
                         }
                         if let Some(config) = query_cache {
-                            builder = builder
-                                .with_query_cache(Arc::new(open_query_cache(&config.directory)?))
-                                .with_query_cache_options(config.options());
+                            let max_bytes = config
+                                .max_bytes
+                                .map_or(DEFAULT_QUERY_CACHE_MAX_BYTES, |max_bytes| {
+                                    max_bytes as usize
+                                });
+                            builder = builder.with_query_cache(
+                                Arc::new(open_query_cache(&config.directory)?),
+                                max_bytes,
+                            );
                         }
                         builder.build().await
                     })
@@ -514,46 +485,6 @@ impl MobileConvexClient {
             .spawn(async move { client.set_auth(token).await })
             .await
             .map_err(|e| e.into())
-    }
-
-    /// Delete cached query results, e.g. when the user signs out.
-    pub async fn clear_query_cache(&self) -> Result<(), ClientError> {
-        // Clear through the client if it's running so it also forgets cached
-        // results in memory; otherwise clearing storage is enough, without
-        // connecting just to do it.
-        let _init_guard = self.client_init_lock.lock().await;
-        match self.client.get() {
-            Some(client) => {
-                let client = client.clone();
-                self.rt
-                    .spawn(async move { client.clear_query_cache().await })
-                    .await
-                    .map_err(anyhow::Error::from)??;
-            },
-            None => {
-                if let Some(directory) = self.query_cache.as_ref().map(|c| c.directory.clone()) {
-                    self.rt
-                        .spawn(async move { open_query_cache(&directory)?.clear().await })
-                        .await
-                        .map_err(anyhow::Error::from)??;
-                }
-            },
-        }
-        Ok(())
-    }
-
-    /// Wait until cached query results changed so far are saved, e.g. before
-    /// the app is suspended. Does nothing without a query cache or before the
-    /// client has connected.
-    pub async fn flush_query_cache(&self) -> Result<(), ClientError> {
-        let Some(client) = self.client.get().cloned() else {
-            return Ok(());
-        };
-        self.rt
-            .spawn(async move { client.flush_query_cache().await })
-            .await
-            .map_err(anyhow::Error::from)??;
-        Ok(())
     }
 
     /// Set an auth token fetcher callback.
